@@ -1,0 +1,16 @@
+# === 凭证与本地配置（绝不入库） ===
+config.json
+*.local
+.env
+secrets.*
+
+# === 运行产物 ===
+artifacts/
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+
+# === 编辑器 ===
+.vscode/
+.idea/
