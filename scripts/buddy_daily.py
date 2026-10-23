@@ -20,6 +20,7 @@ GrowthCenter 页面 chunk 反向核实，并用真实账号逐一实测（见 do
 实际桌面端点均带 /v2 前缀。
 """
 import argparse
+import base64
 import datetime
 import json
 import os
@@ -72,6 +73,29 @@ def mask(text):
     if len(text) <= 12:
         return "***"
     return text[:4] + "***" + text[-4:]
+
+
+def token_expiry(token):
+    """从 JWT 解析到期时间。返回 (剩余天数, 到期时间字符串)；解析不出返回 (None, None)。
+
+    WorkBuddy 的登录令牌是标准 JWT（iss = Keycloak realm），payload 里带 exp，
+    因此可以精确算出还剩几天，在到期前主动提醒，而不是等它失效了才知道。
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None, None
+        seg = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(seg))
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)):
+            return None, None
+        days = (exp - time.time()) / 86400.0
+        expire_at = (datetime.datetime.fromtimestamp(exp, datetime.timezone.utc)
+                     + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+        return days, expire_at
+    except Exception:  # noqa: BLE001
+        return None, None
 
 
 def sanitize(obj):
@@ -603,11 +627,18 @@ def main():
         headers["X-Domain"] = dom
 
     log(f"端点: {ENDPOINT} | 账号: {user_id or '(未提供)'} | 令牌: {mask(token)}")
+
+    # 令牌剩余有效期（JWT 自带 exp，可精确算出还剩几天）
+    days_left, expire_at = token_expiry(token)
+    if days_left is not None:
+        log(f"令牌到期: {expire_at}（剩余 {days_left:.1f} 天）")
     opener = build_opener()
 
     summary = {"time": datetime.datetime.now().isoformat(), "version": VERSION,
                "endpoint": ENDPOINT, "user_id": user_id, "checkin": None,
-               "remaining": None, "cat": None, "push": [], "overall": None}
+               "remaining": None, "cat": None, "push": [], "overall": None,
+               "token_days_left": (round(days_left, 1) if days_left is not None else None),
+               "token_expire_at": expire_at}
 
     # ---- 1) 签到（决定整体成败） ----
     # 令牌有效期约 28 天，过期后接口返回 401/403。若不显式识别，
@@ -659,6 +690,13 @@ def main():
     # ---- 4) 推送（飞书 / 微信） ----
     if not args.dry_run:
         title, ck, catl, html = build_report(checkin, remaining, cat or {})
+        # 到期前预警：令牌约 28 天一换，提前 3 天开始每天提醒，避免断签
+        if days_left is not None and days_left <= 3 and not token_expired:
+            left_txt = ("今天" if days_left < 1 else "%.0f 天后" % days_left)
+            title = "⚠️ 令牌%s到期 " % left_txt + title
+            ck = ("WorkBuddy 登录令牌将于 %s 到期（剩余 %.1f 天）。\n"
+                  "到期后云端会停止领取，请及时更新 Secret：WB_ACCESS_TOKEN。\n\n"
+                  % (expire_at, days_left)) + ck
         if token_expired:
             # 标题前置告警，保证手机推送首屏就能看到"需要人工介入"
             title = "⚠️ 令牌失效·需更新 " + title
