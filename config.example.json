@@ -1,0 +1,10 @@
+{
+  "endpoint": "https://copilot.tencent.com",
+  "access_token": "",
+  "user_id": "",
+  "enterprise_id": "",
+  "domain": "",
+  "wxpusher_token": "",
+  "wxpusher_uid": "",
+  "pushplus_token": ""
+}
