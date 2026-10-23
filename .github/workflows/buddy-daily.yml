@@ -23,15 +23,19 @@ jobs:
         id: py
         shell: bash
         run: |
-          if command -v python3 >/dev/null 2>&1; then
-            echo "bin=python3" >> "$GITHUB_OUTPUT"
-          elif command -v python >/dev/null 2>&1; then
-            echo "bin=python" >> "$GITHUB_OUTPUT"
-          else
+          # 注意：不能在本步骤内用 ${{ steps.py.outputs.bin }} 引用自己的输出——
+          # 表达式在步骤开始前就已渲染，此时 outputs 还是空的，会得到空命令。
+          # 因此先存到 shell 变量，再写进 GITHUB_OUTPUT 供后续步骤使用。
+          PYBIN="$(command -v python3 || true)"
+          if [ -z "$PYBIN" ]; then
+            PYBIN="$(command -v python || true)"
+          fi
+          if [ -z "$PYBIN" ]; then
             echo "::error::未找到 Python 解释器"
             exit 1
           fi
-          "${{ steps.py.outputs.bin }}" --version
+          echo "bin=$PYBIN" >> "$GITHUB_OUTPUT"
+          "$PYBIN" --version
 
       - name: 执行签到 + 派猫 + 推送
         env:
