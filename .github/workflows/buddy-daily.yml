@@ -53,6 +53,9 @@ jobs:
           WXPUSHER_TOKEN: ${{ secrets.WXPUSHER_TOKEN }}
           WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          # —— 昨日收获状态文件（用运行自带的 GITHUB_TOKEN 读写仓库内 state/daily.json，
+          #    不会触发新的 workflow 运行）——
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ${{ steps.py.outputs.bin }} scripts/buddy_daily.py
 
       - name: 上传脱敏运行摘要

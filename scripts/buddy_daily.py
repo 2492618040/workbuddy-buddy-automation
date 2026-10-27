@@ -31,8 +31,12 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 USER_AGENT = f"workbuddy-buddy-automation/{VERSION} (+https://github.com/)"
+
+# 北京时间（UTC+8）。GitHub runner 系统时区是 UTC，直接用本地时间会把标题
+# 打成"前一天 22:xx"（北京时间 06:xx = UTC 前一天 22:xx），故一律固定时区。
+BJ_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 # ---------------------------------------------------------------- 接口定义 --
 # 端点：桌面端 prod endpoint（app.asar 中 DEV_ENV_ENDPOINTS.prod 实测确认）
@@ -174,16 +178,113 @@ def biz_ok(resp):
     return isinstance(resp, dict) and resp.get("code") == 0
 
 
+def bj_now():
+    """北京时间（runner 无论在哪个时区，推送标题的日期一律以北京时间为准）。"""
+    return datetime.datetime.now(BJ_TZ)
+
+
 def now_str():
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    return bj_now().strftime("%Y-%m-%d %H:%M")
+
+
+def bj_date(offset_days=0):
+    """北京时区的日期字符串（offset_days=-1 即昨天），供签到历史/状态文件使用。"""
+    return (bj_now() + datetime.timedelta(days=offset_days)).strftime("%Y-%m-%d")
+
+
+# --------------------------------------------------- 昨日收获（状态文件） --
+# 猫猫积分没有历史查询接口，因此每次运行把当日收获写入仓库内 state/daily.json
+# （经 GitHub Contents API，用运行自带的 GITHUB_TOKEN，本地模式自动跳过），
+# 次日运行读出即为"昨天的积分"。任何失败都只记日志，绝不影响主流程。
+GITHUB_API = "https://api.github.com"
+STATE_FILE_PATH = os.environ.get("STATE_FILE_PATH", "state/daily.json")
+STATE_KEEP_DAYS = 14
+
+
+def state_target():
+    """返回 (repo, branch, token)；本地模式（缺 GITHUB_TOKEN/GITHUB_REPOSITORY）返回 None。"""
+    repo = os.environ.get("STATE_REPO") or os.environ.get("GITHUB_REPOSITORY") or ""
+    token = os.environ.get("GITHUB_TOKEN") or ""
+    branch = os.environ.get("STATE_BRANCH") or os.environ.get("GITHUB_REF_NAME") or "main"
+    if repo and token:
+        return repo, branch, token
+    return None
+
+
+def state_load():
+    """读取状态文件。返回 (days dict, sha 或 None)；读取失败返回 ({}, None)。"""
+    tgt = state_target()
+    if not tgt:
+        return {}, None
+    repo, branch, token = tgt
+    url = f"{GITHUB_API}/repos/{repo}/contents/{STATE_FILE_PATH}?ref={branch}"
+    req = urllib.request.Request(url, method="GET", headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": USER_AGENT,
+    })
+    try:
+        with build_opener().open(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        raw = data.get("content") or ""
+        if data.get("encoding") == "base64":
+            days = json.loads(base64.b64decode(raw).decode("utf-8"))
+        else:
+            days = json.loads(raw)
+        if not isinstance(days, dict):
+            return {}, None
+        return days, data.get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {}, None   # 首次运行，还没有状态文件
+        log(f"状态文件读取失败 HTTP {e.code}（不影响主流程）")
+        return {}, None
+    except Exception as e:  # noqa: BLE001
+        log(f"状态文件读取失败（不影响主流程）: {e}")
+        return {}, None
+
+
+def state_record(day_date, checkin_credit, cat_credit):
+    """把当日收获写入状态文件（best-effort）。"""
+    tgt = state_target()
+    if not tgt:
+        return
+    repo, branch, token = tgt
+    days, sha = state_load()
+    rec = days.setdefault("days", {})
+    rec[day_date] = {"checkin_credit": checkin_credit or 0,
+                     "cat_credit": cat_credit or 0}
+    days["days"] = dict(sorted(rec.items())[-STATE_KEEP_DAYS:])   # 只留最近 N 天
+    days["updated_at"] = bj_now().isoformat()
+    body = {
+        "message": f"chore: state {day_date} (auto)",
+        "branch": branch,
+        "content": base64.b64encode(
+            json.dumps(days, ensure_ascii=False).encode("utf-8")).decode("ascii"),
+    }
+    if sha:
+        body["sha"] = sha
+    url = f"{GITHUB_API}/repos/{repo}/contents/{STATE_FILE_PATH}"
+    req = urllib.request.Request(url, method="PUT", headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }, data=json.dumps(body).encode("utf-8"))
+    try:
+        with build_opener().open(req, timeout=20) as resp:
+            resp.read()
+        log(f"状态文件已写入: {day_date} 签到{checkin_credit or 0} 猫猫{cat_credit or 0}")
+    except Exception as e:  # noqa: BLE001
+        log(f"状态文件写入失败（不影响主流程）: {e}")
 
 
 # ---------------------------------------------------------------- 业务：签到 --
 def do_checkin(opener, headers):
     """签到：先查状态，未签则领。返回结果 dict。"""
     result = {"action": None, "success": False, "streak_days": None,
-              "today_credit": None, "message": "", "raw_status": None,
-              "raw_claim": None}
+              "today_credit": None, "yesterday_credit": None, "message": "",
+              "raw_status": None, "raw_claim": None}
     _, status = http_json(opener, "POST", CHECKIN_STATUS_PATH, {}, headers)
     if not biz_ok(status):
         raise ApiError(f"查询签到状态失败: code={status.get('code')} msg={status.get('msg')}",
@@ -193,6 +294,9 @@ def do_checkin(opener, headers):
     today = bool(sdata.get("today_checked_in"))
     result["streak_days"] = sdata.get("streak_days")
     result["today_credit"] = sdata.get("today_credit")
+    # 昨天是否签过：接口自带历史签到日期表，昨天在其中即昨天已领
+    if bj_date(-1) in (sdata.get("checkin_dates") or []):
+        result["yesterday_credit"] = sdata.get("daily_credit")
     if today:
         result["action"] = "skip"
         result["success"] = True
@@ -459,8 +563,8 @@ def do_cat_flow(opener, headers, adopt=False, location_id=None):
 
 
 # ---------------------------------------------------------------- 推送通道 --
-def push_feishu(webhook, title, checkin_lines, cat_lines):
-    """飞书自定义机器人：interactive 卡片，签到结果与猫猫状态分节展示。"""
+def push_feishu(webhook, title, yesterday_lines, checkin_lines, cat_lines):
+    """飞书自定义机器人：interactive 卡片，昨日收获/签到/猫猫分节展示。"""
     def section(text):
         return {"tag": "div", "text": {"tag": "lark_md", "content": text}}
     card = {
@@ -472,6 +576,8 @@ def push_feishu(webhook, title, checkin_lines, cat_lines):
                 "title": {"tag": "plain_text", "content": title},
             },
             "elements": [
+                section("**📊 昨日收获**\n" + "\n".join(yesterday_lines)),
+                {"tag": "hr"},
                 section("**📅 签到结果**\n" + "\n".join(checkin_lines)),
                 {"tag": "hr"},
                 section("**🐱 猫猫状态**\n" + "\n".join(cat_lines)),
@@ -531,9 +637,21 @@ def push_pushplus(token, title, html):
     return True
 
 
-def build_report(checkin, remaining, cat):
-    """生成 (标题, 签到行, 猫猫行, html)。"""
+def build_report(checkin, remaining, cat, yesterday=None):
+    """生成 (标题, 昨日行, 签到行, 猫猫行, html)。yesterday=(昨日签到积分, 昨日猫猫积分)。"""
     title = f"Buddy加油站 · {now_str()}"
+    # ---- 昨日收获 ----
+    y_ck, y_cat = (yesterday if isinstance(yesterday, tuple) else (None, None))
+    yl = []
+    if y_ck is not None:
+        yl.append(f"📅 签到：+{y_ck} 积分")
+    if y_cat is not None:
+        yl.append(f"🐱 猫猫：+{y_cat} 积分")
+    if y_ck is not None and y_cat is not None:
+        yl.append(f"🧮 合计：+{(y_ck or 0) + (y_cat or 0)} 积分")
+    if not yl:
+        yl.append("（暂无昨日记录，明天起自动补齐）")
+
     if checkin["action"] == "claim":
         ck = [f"✅ 签到成功：+{checkin['today_credit']} 积分",
               f"🔗 连续签到：{checkin['streak_days']} 天"]
@@ -571,10 +689,11 @@ def build_report(checkin, remaining, cat):
 
     html = (
         f"<h3>{title}</h3>"
+        f"<h4>📊 昨日收获</h4><p>{'<br/>'.join(yl)}</p>"
         f"<h4>📅 签到结果</h4><p>{'<br/>'.join(ck)}</p>"
         f"<h4>🐱 猫猫状态</h4><p>{'<br/>'.join(catl)}</p>"
     )
-    return title, ck, catl, html
+    return title, yl, ck, catl, html
 
 
 # -------------------------------------------------------------------- main --
@@ -634,7 +753,7 @@ def main():
         log(f"令牌到期: {expire_at}（剩余 {days_left:.1f} 天）")
     opener = build_opener()
 
-    summary = {"time": datetime.datetime.now().isoformat(), "version": VERSION,
+    summary = {"time": bj_now().isoformat(), "version": VERSION,
                "endpoint": ENDPOINT, "user_id": user_id, "checkin": None,
                "remaining": None, "cat": None, "push": [], "overall": None,
                "token_days_left": (round(days_left, 1) if days_left is not None else None),
@@ -689,7 +808,21 @@ def main():
 
     # ---- 4) 推送（飞书 / 微信） ----
     if not args.dry_run:
-        title, ck, catl, html = build_report(checkin, remaining, cat or {})
+        # 昨日收获：签到部分优先用接口自带历史（checkin_dates），
+        # 猫猫部分只能来自上次运行写入的状态文件（无历史接口）。
+        y_checkin = checkin.get("yesterday_credit")
+        y_cat = None
+        if checkin["success"]:
+            state_days, _sha = state_load()
+            y_rec = (state_days.get("days") or {}).get(bj_date(-1)) or {}
+            if y_checkin is None:
+                y_checkin = y_rec.get("checkin_credit")
+            y_cat = y_rec.get("cat_credit")
+            if y_checkin is not None or y_cat is not None:
+                log(f"昨日收获: 签到 {y_checkin} | 猫猫 {y_cat}")
+
+        title, yl, ck, catl, html = build_report(checkin, remaining, cat or {},
+                                                 yesterday=(y_checkin, y_cat))
         # 到期前预警：令牌约 28 天一换，提前 3 天开始每天提醒，避免断签
         if days_left is not None and days_left <= 3 and not token_expired:
             left_txt = ("今天" if days_left < 1 else "%.0f 天后" % days_left)
@@ -704,7 +837,7 @@ def main():
                   "请在本机重新获取令牌后更新仓库 Secret：WB_ACCESS_TOKEN。\n\n") + ck
         jobs = []
         if feishu:
-            jobs.append(("飞书", lambda: push_feishu(feishu, title, ck, catl)))
+            jobs.append(("飞书", lambda: push_feishu(feishu, title, yl, ck, catl)))
         if wx_token and wx_uids:
             jobs.append(("微信(WxPusher)", lambda: push_wxpusher(wx_token, wx_uids, title, html)))
         if pp_token:
@@ -720,6 +853,13 @@ def main():
                 log(f"推送失败({name}): {e}")
         if not jobs:
             log("未配置任何推送通道（FEISHU_WEBHOOK / WXPUSHER_TOKEN+UID / PUSHPLUS_TOKEN）")
+
+        # ---- 写状态文件（供明天推送"昨日收获"；本地模式自动跳过） ----
+        if checkin["success"]:
+            cat_credit = ((cat or {}).get("claim") or {}).get("reward_credit")
+            state_record(bj_date(0),
+                         checkin.get("today_credit") or 0,
+                         cat_credit or 0)
 
     # ---- 5) 摘要落盘（脱敏） ----
     summary["overall"] = "success" if checkin["success"] else "failed"
