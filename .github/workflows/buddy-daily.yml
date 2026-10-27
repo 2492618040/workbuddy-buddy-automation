@@ -70,6 +70,8 @@ jobs:
       # 保活提交：GitHub 会对 60 天无仓库活动的仓库自动停用 schedule 工作流。
       # 每次运行写一个日期戳并提交，保证仓库持续有活动，定时任务永不失联。
       # 说明：GITHUB_TOKEN 的推送不会触发新的 workflow 运行，无递归风险。
+      # 注意：脚本步骤可能已通过 Contents API 写入 state/daily.json（远端分支前移），
+      # 因此推送前必须先 rebase 到远端最新，否则会被 non-fast-forward 拒绝。
       - name: 保活提交（维持定时任务活跃）
         if: always()
         run: |
@@ -81,5 +83,7 @@ jobs:
             echo "无需提交（日期未变）"
           else
             git commit -m "chore: keep-alive $(date -u +%Y-%m-%d)"
-            git push
+            git fetch origin main
+            git rebase origin/main || git rebase --abort
+            git push || (git rebase origin/main && git push)
           fi
