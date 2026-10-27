@@ -31,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 USER_AGENT = f"workbuddy-buddy-automation/{VERSION} (+https://github.com/)"
 
 # 北京时间（UTC+8）。GitHub runner 系统时区是 UTC，直接用本地时间会把标题
@@ -244,16 +244,20 @@ def state_load():
         return {}, None
 
 
-def state_record(day_date, checkin_credit, cat_credit):
-    """把当日收获写入状态文件（best-effort）。"""
+def state_record(day_date, checkin_credit, cat_credit, remaining=None):
+    """把当日收获写入状态文件（best-effort）。
+    remaining = 当日签到后查询到的剩余积分（即当日结束时的余额）；
+    次日运行时读出来即「昨日剩余积分」。"""
     tgt = state_target()
     if not tgt:
         return
     repo, branch, token = tgt
     days, sha = state_load()
     rec = days.setdefault("days", {})
+    # remaining 为签到后查询到的当前余额，次日运行时读出来即"昨日剩余积分"。
     rec[day_date] = {"checkin_credit": checkin_credit or 0,
-                     "cat_credit": cat_credit or 0}
+                     "cat_credit": cat_credit or 0,
+                     "remaining": remaining}
     days["days"] = dict(sorted(rec.items())[-STATE_KEEP_DAYS:])   # 只留最近 N 天
     days["updated_at"] = bj_now().isoformat()
     body = {
@@ -274,7 +278,7 @@ def state_record(day_date, checkin_credit, cat_credit):
     try:
         with build_opener().open(req, timeout=20) as resp:
             resp.read()
-        log(f"状态文件已写入: {day_date} 签到{checkin_credit or 0} 猫猫{cat_credit or 0}")
+        log(f"状态文件已写入: {day_date} 签到{checkin_credit or 0} 猫猫{cat_credit or 0} 剩余{remaining}")
     except Exception as e:  # noqa: BLE001
         log(f"状态文件写入失败（不影响主流程）: {e}")
 
@@ -637,8 +641,9 @@ def push_pushplus(token, title, html):
     return True
 
 
-def build_report(checkin, remaining, cat, yesterday=None):
-    """生成 (标题, 昨日行, 签到行, 猫猫行, html)。yesterday=(昨日签到积分, 昨日猫猫积分)。"""
+def build_report(checkin, remaining, cat, yesterday=None, y_remaining=None):
+    """生成 (标题, 昨日行, 签到行, 猫猫行, html)。
+    yesterday=(昨日签到积分, 昨日猫猫积分)；y_remaining=昨日结束时的剩余积分（余额）。"""
     title = f"Buddy加油站 · {now_str()}"
     # ---- 昨日收获 ----
     y_ck, y_cat = (yesterday if isinstance(yesterday, tuple) else (None, None))
@@ -649,6 +654,8 @@ def build_report(checkin, remaining, cat, yesterday=None):
         yl.append(f"🐱 猫猫：+{y_cat} 积分")
     if y_ck is not None and y_cat is not None:
         yl.append(f"🧮 合计：+{(y_ck or 0) + (y_cat or 0)} 积分")
+    if y_remaining is not None:
+        yl.append(f"💰 昨日剩余积分：{y_remaining}")
     if not yl:
         yl.append("（暂无昨日记录，明天起自动补齐）")
 
@@ -812,17 +819,20 @@ def main():
         # 猫猫部分只能来自上次运行写入的状态文件（无历史接口）。
         y_checkin = checkin.get("yesterday_credit")
         y_cat = None
+        y_remaining = None
         if checkin["success"]:
             state_days, _sha = state_load()
             y_rec = (state_days.get("days") or {}).get(bj_date(-1)) or {}
             if y_checkin is None:
                 y_checkin = y_rec.get("checkin_credit")
             y_cat = y_rec.get("cat_credit")
-            if y_checkin is not None or y_cat is not None:
-                log(f"昨日收获: 签到 {y_checkin} | 猫猫 {y_cat}")
+            y_remaining = y_rec.get("remaining")
+            if y_checkin is not None or y_cat is not None or y_remaining is not None:
+                log(f"昨日收获: 签到 {y_checkin} | 猫猫 {y_cat} | 剩余 {y_remaining}")
 
         title, yl, ck, catl, html = build_report(checkin, remaining, cat or {},
-                                                 yesterday=(y_checkin, y_cat))
+                                                 yesterday=(y_checkin, y_cat),
+                                                 y_remaining=y_remaining)
         # 到期前预警：令牌约 28 天一换，提前 3 天开始每天提醒，避免断签
         if days_left is not None and days_left <= 3 and not token_expired:
             left_txt = ("今天" if days_left < 1 else "%.0f 天后" % days_left)
@@ -859,7 +869,8 @@ def main():
             cat_credit = ((cat or {}).get("claim") or {}).get("reward_credit")
             state_record(bj_date(0),
                          checkin.get("today_credit") or 0,
-                         cat_credit or 0)
+                         cat_credit or 0,
+                         remaining)
 
     # ---- 5) 摘要落盘（脱敏） ----
     summary["overall"] = "success" if checkin["success"] else "failed"
