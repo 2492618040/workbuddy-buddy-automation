@@ -725,7 +725,11 @@ def main():
     elif args.config:
         log(f"配置文件不存在: {args.config}")
 
-    token = os.environ.get("WB_ACCESS_TOKEN") or file_cfg.get("access_token") or ""
+    # 云端自续期步骤会把当天新令牌写入 WB_LIVE_ACCESS_TOKEN；优先用它，
+    # 刷新失败时自动回退到 Secret 里的静态令牌，绝不因续期失败而阻断签到。
+    token = (os.environ.get("WB_LIVE_ACCESS_TOKEN")
+             or os.environ.get("WB_ACCESS_TOKEN")
+             or file_cfg.get("access_token") or "")
     user_id = os.environ.get("WB_USER_ID") or file_cfg.get("user_id") or ""
     ent = os.environ.get("WB_ENTERPRISE_ID") or file_cfg.get("enterprise_id") or ""
     dom = os.environ.get("WB_DOMAIN") or file_cfg.get("domain") or ""
