@@ -834,17 +834,28 @@ def main():
                                                  yesterday=(y_checkin, y_cat),
                                                  y_remaining=y_remaining)
         # 到期前预警：令牌约 28 天一换，提前 3 天开始每天提醒，避免断签
+        # ⚠️ ck 是「行列表」不是字符串：告警必须作为列表元素前插。
+        #    2026-11-18 事故根因就是此处用 str + list 抛 TypeError：
+        #    签到虽成功，却没推送、没写状态、run 标红，令牌预警也完全发不出去。
+        def render_html(t, y, c, cl):
+            return (f"<h3>{t}</h3>"
+                    f"<h4>📊 昨日收获</h4><p>{'<br/>'.join(y)}</p>"
+                    f"<h4>📅 签到结果</h4><p>{'<br/>'.join(c)}</p>"
+                    f"<h4>🐱 猫猫状态</h4><p>{'<br/>'.join(cl)}</p>")
+
         if days_left is not None and days_left <= 3 and not token_expired:
             left_txt = ("今天" if days_left < 1 else "%.0f 天后" % days_left)
             title = "⚠️ 令牌%s到期 " % left_txt + title
-            ck = ("WorkBuddy 登录令牌将于 %s 到期（剩余 %.1f 天）。\n"
-                  "到期后云端会停止领取，请及时更新 Secret：WB_ACCESS_TOKEN。\n\n"
-                  % (expire_at, days_left)) + ck
+            ck = ["WorkBuddy 登录令牌将于 %s 到期（剩余 %.1f 天）；"
+                  "到期后云端会停止领取，请及时更新 Secret：WB_ACCESS_TOKEN。"
+                  % (expire_at, days_left)] + ck
         if token_expired:
             # 标题前置告警，保证手机推送首屏就能看到"需要人工介入"
             title = "⚠️ 令牌失效·需更新 " + title
-            ck = ("登录令牌已失效（有效期约 28 天），今日积分未领取。\n"
-                  "请在本机重新获取令牌后更新仓库 Secret：WB_ACCESS_TOKEN。\n\n") + ck
+            ck = ["登录令牌已失效（有效期约 28 天），今日积分未领取。",
+                  "请在本机双击「更新令牌.bat」更新仓库 Secret：WB_ACCESS_TOKEN。"] + ck
+        # 告警改动了 title/ck，重建 HTML 正文，确保微信(WxPusher)推送里也能看到告警
+        html = render_html(title, yl, ck, catl)
         jobs = []
         if feishu:
             jobs.append(("飞书", lambda: push_feishu(feishu, title, yl, ck, catl)))
@@ -892,5 +903,30 @@ def summary_fix(s):
     return sanitize(s)
 
 
+def emergency_alert(exc):
+    """最后一道防线：任何未捕获异常都尽力发一条微信，避免静默断签。
+
+    2026-11-18~11-23 连续 6 天无人知晓，就是因为异常退出时连告警都没发出来。
+    """
+    import html as _html
+    t = os.environ.get("WXPUSHER_TOKEN")
+    u = os.environ.get("WXPUSHER_UID")
+    if not (t and u):
+        return
+    try:
+        push_wxpusher(
+            t, u, "⚠️ Buddy 脚本异常·需人工检查",
+            "<p>Buddy 每日脚本异常退出，今日积分可能未领取，请检查 GitHub Actions 日志：</p>"
+            "<pre>%s</pre>" % _html.escape(str(exc)))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        emergency_alert(e)
+        raise
