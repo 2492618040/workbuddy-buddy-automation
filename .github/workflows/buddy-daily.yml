@@ -37,6 +37,18 @@ jobs:
           echo "bin=$PYBIN" >> "$GITHUB_OUTPUT"
           "$PYBIN" --version
 
+      # 令牌自续期：用长效 refresh_token 换当天新 access_token，并把轮换后的
+      # refresh_token 加密写回仓库 state/rt.json。失败自动回退静态 Secret，
+      # 绝不阻断签到。从此不再需要每 28 天人工更新令牌。
+      - name: 自动续期令牌（云端自持）
+        env:
+          WB_REFRESH_TOKEN: ${{ secrets.WB_REFRESH_TOKEN }}
+          RT_ENC_KEY: ${{ secrets.RT_ENC_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WXPUSHER_TOKEN: ${{ secrets.WXPUSHER_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+        run: ${{ steps.py.outputs.bin }} scripts/cloud_token_renew.py
+
       - name: 执行签到 + 派猫 + 推送
         env:
           # —— 必填：WorkBuddy 登录态（由 GitHub Secrets 注入，绝不写入仓库）——
