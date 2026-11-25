@@ -2,8 +2,12 @@ name: Buddy 每日自动化（签到 + 派猫 + 推送）
 
 on:
   schedule:
-    # 北京时间每天 06:00（GitHub cron 使用 UTC，需减 8 小时）
-    - cron: '0 22 * * *'
+    # GitHub 官方：schedule 在整点高负载时可能延迟甚至被丢弃。
+    # 故避开整点，并设两个时点互为备份（脚本内置当日幂等，重复运行会自动跳过）。
+    # 主时点：北京时间 06:17（UTC 22:17）
+    - cron: '17 22 * * *'
+    # 兜底时点：北京时间 12:23（UTC 04:23）——早上那次若被 GitHub 丢弃，中午补上
+    - cron: '23 4 * * *'
   workflow_dispatch: {}   # 允许在 Actions 页面手动触发（验收用）
 
 # 最小权限原则：本任务只需读写仓库自身内容与摘要产物
@@ -51,6 +55,8 @@ jobs:
 
       - name: 执行签到 + 派猫 + 推送
         env:
+          # 手动触发时强制重跑（绕过当日幂等），定时双时点则靠幂等自动去重
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
           # —— 必填：WorkBuddy 登录态（由 GitHub Secrets 注入，绝不写入仓库）——
           WB_ACCESS_TOKEN: ${{ secrets.WB_ACCESS_TOKEN }}
           WB_USER_ID: ${{ secrets.WB_USER_ID }}
