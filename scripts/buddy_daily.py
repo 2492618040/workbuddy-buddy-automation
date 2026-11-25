@@ -31,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 USER_AGENT = f"workbuddy-buddy-automation/{VERSION} (+https://github.com/)"
 
 # 北京时间（UTC+8）。GitHub runner 系统时区是 UTC，直接用本地时间会把标题
@@ -769,6 +769,27 @@ def main():
                "remaining": None, "cat": None, "push": [], "overall": None,
                "token_days_left": (round(days_left, 1) if days_left is not None else None),
                "token_expire_at": expire_at}
+
+    # ---- 0) 幂等保护：双时点防 GitHub schedule 被丢弃 ----
+    # GitHub 官方明确：schedule 在整点高负载时可能延迟甚至被丢弃。故 workflow
+    # 设了早/晚两个触发点。这里在真正签到前先查当日是否已成功记录过：
+    # 已成功 → 直接静默退出（不重复签到、不重复派猫、不重复推送）；
+    # 未成功 → 正常走完整流程，由第二个时点补上被丢弃的那次。
+    # FORCE_RUN=1 可绕过（手动验收/补签用）。
+    if not args.dry_run and os.environ.get("FORCE_RUN") != "1":
+        _days, _sha = state_load()
+        _today = (_days.get("days") or {}).get(bj_date(0)) or {}
+        if _today.get("checkin_credit"):
+            log(f"今日已成功签到（{_today.get('checkin_credit')} 积分），跳过重复运行。"
+                "（双时点幂等保护；需强制重跑请设 FORCE_RUN=1）")
+            summary["overall"] = "already_done"
+            try:
+                os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+                with open(args.out, "w", encoding="utf-8") as f:
+                    json.dump(summary_fix(summary), f, ensure_ascii=False, indent=2)
+            except Exception:  # noqa: BLE001
+                pass
+            return 0
 
     # ---- 1) 签到（决定整体成败） ----
     # 令牌有效期约 28 天，过期后接口返回 401/403。若不显式识别，
