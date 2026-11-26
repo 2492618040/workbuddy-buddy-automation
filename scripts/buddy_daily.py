@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 USER_AGENT = f"workbuddy-buddy-automation/{VERSION} (+https://github.com/)"
 
 # 北京时间（UTC+8）。GitHub runner 系统时区是 UTC，直接用本地时间会把标题
@@ -398,8 +398,48 @@ def normalize_letter(raw, location=None):
     return None
 
 
+def split_letter(text, where=None):
+    """把来信原文拆成 (称呼, 正文段列表, 落款, 地点)。
+
+    实测原文形如「亲爱的铲屎官：……——Buddy 来自 · 商场店铺」，
+    称呼/落款/地点都嵌在同一串里；这里拆开供手写信排版使用，避免重复显示。
+    兼容没有这些成分的短信件（自动补默认称呼/落款）。
+    """
+    import re
+    text = str(text or "").strip()
+    where = str(where).strip() if where else None
+
+    # 尾部「来自 · 商场店铺」→ 地点
+    m = re.search(r"\s*来自\s*[·:：]\s*(.+?)\s*$", text)
+    if m:
+        if not where:
+            where = m.group(1).strip()
+        text = text[:m.start()].strip()
+
+    # 尾部「——Buddy」→ 落款
+    sign = None
+    m = re.search(r"(——|――|--)\s*(\S{1,20})\s*$", text)
+    if m:
+        sign = m.group(2).strip()
+        text = text[:m.start()].strip()
+
+    # 开头「亲爱的铲屎官：」→ 称呼
+    salut = None
+    m = re.match(r"^((?:亲爱的|尊敬的)[^：:。!！\n]{0,20}[：:])", text)
+    if m:
+        salut = m.group(1).strip()
+        text = text[m.end():].strip()
+    if not salut:
+        salut = "亲爱的铲屎官："
+    if not sign:
+        sign = "Buddy"
+
+    paras = [p.strip() for p in re.split(r"\n+", text) if p.strip()]
+    return salut, paras, sign, where
+
+
 def letter_block(cat):
-    """猫猫来信的 HTML 片段（WxPusher/pushplus 用；无数据返回空串）。
+    """猫猫来信的「手写信纸」HTML 片段（WxPusher/pushplus 用）。
 
     故意不推送任何照片：接口里的头像/立绘/旅行照全是所有账号共享的统一素材
     （白色小机器人插画），并非主人独一无二的猫猫实拍照，故按主人要求不推送。
@@ -407,25 +447,45 @@ def letter_block(cat):
     if not isinstance(cat, dict):
         return ""
     letter = cat.get("letter") or {}
-    parts = []
-    if letter.get("text"):
-        where = letter.get("location")
-        head = "✉️ 猫猫来信" + (f"（来自{html_lib.escape(str(where))}）" if where else "")
-        txt = html_lib.escape(letter["text"]).replace("\n", "<br/>")
-        parts.append(f"<h4>{head}</h4><p>{txt}</p>")
-        if letter.get("guide"):
-            parts.append(f'<p style="color:#888">{html_lib.escape(str(letter["guide"]))}</p>')
-    return "".join(parts)
+    if not letter.get("text"):
+        return ""
+    salut, paras, sign, where = split_letter(letter["text"], letter.get("location"))
+    name = cat.get("buddy_name") or "Buddy"
+    e = html_lib.escape
+    day = bj_date(0)
+
+    # 信纸：米黄底 + 双线抬头 + 首行缩进 + 右对齐落款，模拟手写信。
+    # 字体遵守全局规范：中文宋体、数字/英文 Times New Roman。
+    meta = day + (("　·　寄自 " + e(str(where))) if where else "")
+    body = "<br/>".join(e(p) for p in paras)
+    return (
+        '<div style="margin:16px 0 4px;padding:14px 16px;background:#FFFDF4;'
+        'border:1px solid #E6D5B3;border-left:4px solid #C8A56A;border-radius:4px;'
+        'font-family:\'Times New Roman\',SimSun,\'宋体\',serif;color:#3B3226;">'
+        '<div style="font-size:13px;color:#9A7440;letter-spacing:1px;'
+        'border-bottom:1px dashed #D9C6A2;padding-bottom:6px;margin-bottom:8px;">'
+        '✉️ 一封来自' + e(str(name)) + '的信</div>'
+        '<div style="font-size:12px;color:#A88A5C;margin-bottom:8px;">' + meta + '</div>'
+        '<div style="font-size:14px;line-height:1.9;text-indent:2em;">'
+        + e(salut) + '<br/>' + body + '</div>'
+        '<div style="text-align:right;font-size:13px;color:#8A6D3B;'
+        'margin-top:12px;line-height:1.7;">—— ' + e(str(sign)) + '<br/>' + day + '</div>'
+        '</div>'
+    )
 
 
 def letter_lines(cat):
-    """猫猫来信的纯文本行（飞书卡片用）。"""
+    """猫猫来信的纯文本行（飞书卡片用，引用块样式模拟手写信）。"""
     letter = (cat or {}).get("letter") or {}
     if not letter.get("text"):
         return []
-    where = letter.get("location")
+    salut, paras, sign, where = split_letter(letter["text"], letter.get("location"))
     head = "✉️ 猫猫来信" + (f"（来自{where}）" if where else "")
-    return [head, letter["text"]]
+    lines = [head, "> " + salut]
+    lines += ["> " + p for p in paras]
+    if sign:
+        lines.append("> —— " + sign)
+    return lines
 
 
 def do_cat_flow(opener, headers, adopt=False, location_id=None):
@@ -742,7 +802,8 @@ def build_report(checkin, remaining, cat, yesterday=None, y_remaining=None):
         catl.append(f"✈️ 已派新一趟：「{cat['depart']['location']}」")
     if cat.get("state") == "traveling" and not cat.get("depart"):
         catl.append("🧳 状态：旅行中")
-    catl.extend(letter_lines(cat))  # 猫猫来信正文（微信/飞书都能看到）
+    letter_rows = letter_lines(cat)  # 飞书卡片保留文本行；微信 HTML 只用下方信纸块，避免重复
+    catl.extend(letter_rows)
     # 备注行去重：已被结构化行表达的信息不再重复
     dup_markers = []
     if cat.get("claim"):
@@ -758,12 +819,14 @@ def build_report(checkin, remaining, cat, yesterday=None, y_remaining=None):
     if not catl:
         catl.append("（无猫猫状态信息）")
 
+    # 微信正文：猫猫状态节不重复来信文本，来信统一由手写信纸块呈现
+    catl_html = [x for x in catl if x not in letter_rows]
     html = (
         f"<h3>{title}</h3>"
         f"<h4>📊 昨日收获</h4><p>{'<br/>'.join(yl)}</p>"
         f"<h4>📅 签到结果</h4><p>{'<br/>'.join(ck)}</p>"
-        f"<h4>🐱 猫猫状态</h4><p>{'<br/>'.join(catl)}</p>"
-        + letter_block(cat)   # ✉️ 来信正文（不推照片：均为统一素材）
+        f"<h4>🐱 猫猫状态</h4><p>{'<br/>'.join(catl_html)}</p>"
+        + letter_block(cat)   # ✉️ 手写信纸（不推照片：均为统一素材）
     )
     return title, yl, ck, catl, html
 
@@ -928,10 +991,12 @@ def main():
         #    2026-11-18 事故根因就是此处用 str + list 抛 TypeError：
         #    签到虽成功，却没推送、没写状态、run 标红，令牌预警也完全发不出去。
         def render_html(t, y, c, cl, cat_info=None):
+            letter_r = letter_lines(cat_info)
+            cl_html = [x for x in cl if x not in letter_r]
             return (f"<h3>{t}</h3>"
                     f"<h4>📊 昨日收获</h4><p>{'<br/>'.join(y)}</p>"
                     f"<h4>📅 签到结果</h4><p>{'<br/>'.join(c)}</p>"
-                    f"<h4>🐱 猫猫状态</h4><p>{'<br/>'.join(cl)}</p>"
+                    f"<h4>🐱 猫猫状态</h4><p>{'<br/>'.join(cl_html)}</p>"
                     + letter_block(cat_info))
 
         if days_left is not None and days_left <= 3 and not token_expired:
