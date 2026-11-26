@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 USER_AGENT = f"workbuddy-buddy-automation/{VERSION} (+https://github.com/)"
 
 # 北京时间（UTC+8）。GitHub runner 系统时区是 UTC，直接用本地时间会把标题
@@ -399,21 +399,15 @@ def normalize_letter(raw, location=None):
 
 
 def letter_block(cat):
-    """猫猫来信 + 照片的 HTML 片段（WxPusher/pushplus 用；无数据返回空串）。"""
+    """猫猫来信的 HTML 片段（WxPusher/pushplus 用；无数据返回空串）。
+
+    故意不推送任何照片：接口里的头像/立绘/旅行照全是所有账号共享的统一素材
+    （白色小机器人插画），并非主人独一无二的猫猫实拍照，故按主人要求不推送。
+    """
     if not isinstance(cat, dict):
         return ""
     letter = cat.get("letter") or {}
-    photo = cat.get("photo")
     parts = []
-    if photo:
-        u = html_lib.escape(str(photo))
-        big = html_lib.escape(str(cat.get("photo_full") or photo))
-        # 微信内 HTML 的 <img> 外链常被过滤，故以「可点击链接 + 消息 url 字段」
-        # 为主确保能打开；<img> 小头像作为 App 端可直接内显的增强。
-        parts.append(
-            '<p style="margin:4px 0">🐾 猫猫照片：<a href="%s">👉 点击查看 / 保存全身大图</a>'
-            '<br/><img src="%s" alt="猫猫照片" style="max-width:200px;border-radius:8px"/></p>'
-            % (big, u))
     if letter.get("text"):
         where = letter.get("location")
         head = "✉️ 猫猫来信" + (f"（来自{html_lib.escape(str(where))}）" if where else "")
@@ -443,8 +437,6 @@ def do_cat_flow(opener, headers, adopt=False, location_id=None):
     out = {
         "success": True,               # 猫猫部分是否按预期走完（无异常）
         "buddy_name": None,
-        "photo": None,                 # 猫猫小头像 URL（正文内嵌预览，加载快）
-        "photo_full": None,            # 猫猫全身立绘 URL（点消息打开的大图）
         "letter": None,                # {"text","guide","location"} 猫猫来信
         "claim": None,                 # {"reward_credit": n, "letter": "..."}
         "depart": None,                # {"location": "咖啡馆", "location_id": 1}
@@ -501,11 +493,8 @@ def do_cat_flow(opener, headers, adopt=False, location_id=None):
             return out
 
     out["buddy_name"] = buddy.get("name") or buddy.get("nickname") or "猫猫"
-    # 猫猫照片：旅行地点封面实测均为空，改用猫猫自身立绘。
-    # base_static_url=全身立绘(2048x2048，更好看) 作点开大图；thumbnail_url=小头像作正文内嵌预览。
-    out["photo_full"] = (buddy.get("base_static_url") or buddy.get("full_animated_url")
-                         or buddy.get("thumbnail_url"))
-    out["photo"] = (buddy.get("thumbnail_url") or out["photo_full"])
+    # 不推送猫猫照片：接口里的头像/立绘/旅行照均为所有账号共享的统一素材
+    # （白色小机器人插画），非主人猫猫独有实拍照，按主人要求只推来信、不推照片。
 
     # 1) 先领取已到家的旅行积分
     try:
@@ -774,7 +763,7 @@ def build_report(checkin, remaining, cat, yesterday=None, y_remaining=None):
         f"<h4>📊 昨日收获</h4><p>{'<br/>'.join(yl)}</p>"
         f"<h4>📅 签到结果</h4><p>{'<br/>'.join(ck)}</p>"
         f"<h4>🐱 猫猫状态</h4><p>{'<br/>'.join(catl)}</p>"
-        + letter_block(cat)   # ✉️ 来信正文 + 🐾 猫猫照片
+        + letter_block(cat)   # ✉️ 来信正文（不推照片：均为统一素材）
     )
     return title, yl, ck, catl, html
 
@@ -962,11 +951,8 @@ def main():
         if feishu:
             jobs.append(("飞书", lambda: push_feishu(feishu, title, yl, ck, catl)))
         if wx_token and wx_uids:
-            # url 字段指向猫猫全身立绘：微信内 <img> 外链常被过滤，点消息原文可打开大图
-            photo_url = ((cat or {}).get("photo_full") or (cat or {}).get("photo")
-                         if isinstance(cat, dict) else None)
             jobs.append(("微信(WxPusher)",
-                         lambda: push_wxpusher(wx_token, wx_uids, title, html, url=photo_url)))
+                         lambda: push_wxpusher(wx_token, wx_uids, title, html)))
         if pp_token:
             jobs.append(("微信(pushplus)", lambda: push_pushplus(pp_token, title, html)))
         for name, fn in jobs:
