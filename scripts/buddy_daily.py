@@ -22,6 +22,7 @@ GrowthCenter 页面 chunk 反向核实，并用真实账号逐一实测（见 do
 import argparse
 import base64
 import datetime
+import html as html_lib
 import json
 import os
 import random
@@ -31,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 USER_AGENT = f"workbuddy-buddy-automation/{VERSION} (+https://github.com/)"
 
 # 北京时间（UTC+8）。GitHub runner 系统时区是 UTC，直接用本地时间会把标题
@@ -381,6 +382,55 @@ def travel_locations(opener, headers):
     return (resp.get("data") or {}).get("locations") or []
 
 
+def normalize_letter(raw, location=None):
+    """把 travel/status 或 travel/claim 的 letter 字段统一成 dict。
+
+    实测 letter 有两种形态：str（claim 返回）或
+    dict{"id","text","guide_text"}（status 返回），这里统一。
+    """
+    where = (location or {}).get("name") if isinstance(location, dict) else location
+    if isinstance(raw, str):
+        return {"text": raw.strip(), "guide": None, "location": where}
+    if isinstance(raw, dict):
+        text = raw.get("text") or raw.get("content") or ""
+        return {"text": str(text).strip(), "guide": raw.get("guide_text"),
+                "location": where}
+    return None
+
+
+def letter_block(cat):
+    """猫猫来信 + 照片的 HTML 片段（WxPusher/pushplus 用；无数据返回空串）。"""
+    if not isinstance(cat, dict):
+        return ""
+    letter = cat.get("letter") or {}
+    photo = cat.get("photo")
+    parts = []
+    if photo:
+        u = html_lib.escape(str(photo))
+        parts.append(
+            '<p style="margin:4px 0">🐾 <a href="%s">查看猫猫照片</a>'
+            '<br/><img src="%s" alt="Buddy" style="max-width:180px;border-radius:8px"/></p>'
+            % (u, u))
+    if letter.get("text"):
+        where = letter.get("location")
+        head = "✉️ 猫猫来信" + (f"（来自{html_lib.escape(str(where))}）" if where else "")
+        txt = html_lib.escape(letter["text"]).replace("\n", "<br/>")
+        parts.append(f"<h4>{head}</h4><p>{txt}</p>")
+        if letter.get("guide"):
+            parts.append(f'<p style="color:#888">{html_lib.escape(str(letter["guide"]))}</p>')
+    return "".join(parts)
+
+
+def letter_lines(cat):
+    """猫猫来信的纯文本行（飞书卡片用）。"""
+    letter = (cat or {}).get("letter") or {}
+    if not letter.get("text"):
+        return []
+    where = letter.get("location")
+    head = "✉️ 猫猫来信" + (f"（来自{where}）" if where else "")
+    return [head, letter["text"]]
+
+
 def do_cat_flow(opener, headers, adopt=False, location_id=None):
     """派猫流程（对主人规格的实现）：
     1. 领取已到家的旅行积分（state == arrived 时；'no unclaimed travel' 视为无可领）；
@@ -390,6 +440,8 @@ def do_cat_flow(opener, headers, adopt=False, location_id=None):
     out = {
         "success": True,               # 猫猫部分是否按预期走完（无异常）
         "buddy_name": None,
+        "photo": None,                 # 猫猫照片 URL（thumbnail_url）
+        "letter": None,                # {"text","guide","location"} 猫猫来信
         "claim": None,                 # {"reward_credit": n, "letter": "..."}
         "depart": None,                # {"location": "咖啡馆", "location_id": 1}
         "state": None,
@@ -445,6 +497,9 @@ def do_cat_flow(opener, headers, adopt=False, location_id=None):
             return out
 
     out["buddy_name"] = buddy.get("name") or buddy.get("nickname") or "猫猫"
+    # 猫猫照片：旅行地点封面实测均为空，改用猫猫自身立绘（头像/全身图）展示
+    out["photo"] = (buddy.get("thumbnail_url") or buddy.get("base_static_url")
+                    or buddy.get("full_animated_url"))
 
     # 1) 先领取已到家的旅行积分
     try:
@@ -452,6 +507,9 @@ def do_cat_flow(opener, headers, adopt=False, location_id=None):
         out["state"] = st.get("state")
         out["daily_limit_reached"] = bool(st.get("daily_limit_reached"))
         out["raw"].append({"api": "travel/status", "resp": sanitize(st)})
+        # 来信兜底：状态里若自带 letter 先存一份（arrived 待领/已领都可能带）
+        if st.get("letter"):
+            out["letter"] = normalize_letter(st.get("letter"), st.get("location"))
         if st.get("state") == "arrived":
             try:
                 _, claim = http_json(opener, "POST", TRAVEL_CLAIM_PATH, {}, headers)
@@ -460,6 +518,11 @@ def do_cat_flow(opener, headers, adopt=False, location_id=None):
                     cdata = claim.get("data") or {}
                     out["claim"] = {"reward_credit": cdata.get("reward_credit"),
                                     "letter": cdata.get("letter")}
+                    # 来信：优先取 claim 返回；缺失则回退到 claim 前的 status 快照
+                    letter = normalize_letter(cdata.get("letter"), st.get("location"))
+                    if not letter:
+                        letter = normalize_letter(st.get("letter"), st.get("location"))
+                    out["letter"] = letter
                     note(f"猫猫已到家，领取旅行积分 {cdata.get('reward_credit')} 分")
                 else:
                     msg = str(claim.get("msg") or "")
@@ -679,6 +742,7 @@ def build_report(checkin, remaining, cat, yesterday=None, y_remaining=None):
         catl.append(f"✈️ 已派新一趟：「{cat['depart']['location']}」")
     if cat.get("state") == "traveling" and not cat.get("depart"):
         catl.append("🧳 状态：旅行中")
+    catl.extend(letter_lines(cat))  # 猫猫来信正文（微信/飞书都能看到）
     # 备注行去重：已被结构化行表达的信息不再重复
     dup_markers = []
     if cat.get("claim"):
@@ -699,6 +763,7 @@ def build_report(checkin, remaining, cat, yesterday=None, y_remaining=None):
         f"<h4>📊 昨日收获</h4><p>{'<br/>'.join(yl)}</p>"
         f"<h4>📅 签到结果</h4><p>{'<br/>'.join(ck)}</p>"
         f"<h4>🐱 猫猫状态</h4><p>{'<br/>'.join(catl)}</p>"
+        + letter_block(cat)   # ✉️ 来信正文 + 🐾 猫猫照片
     )
     return title, yl, ck, catl, html
 
@@ -862,11 +927,12 @@ def main():
         # ⚠️ ck 是「行列表」不是字符串：告警必须作为列表元素前插。
         #    2026-11-18 事故根因就是此处用 str + list 抛 TypeError：
         #    签到虽成功，却没推送、没写状态、run 标红，令牌预警也完全发不出去。
-        def render_html(t, y, c, cl):
+        def render_html(t, y, c, cl, cat_info=None):
             return (f"<h3>{t}</h3>"
                     f"<h4>📊 昨日收获</h4><p>{'<br/>'.join(y)}</p>"
                     f"<h4>📅 签到结果</h4><p>{'<br/>'.join(c)}</p>"
-                    f"<h4>🐱 猫猫状态</h4><p>{'<br/>'.join(cl)}</p>")
+                    f"<h4>🐱 猫猫状态</h4><p>{'<br/>'.join(cl)}</p>"
+                    + letter_block(cat_info))
 
         if days_left is not None and days_left <= 3 and not token_expired:
             left_txt = ("今天" if days_left < 1 else "%.0f 天后" % days_left)
@@ -880,7 +946,7 @@ def main():
             ck = ["登录令牌已失效（有效期约 28 天），今日积分未领取。",
                   "请在本机双击「更新令牌.bat」更新仓库 Secret：WB_ACCESS_TOKEN。"] + ck
         # 告警改动了 title/ck，重建 HTML 正文，确保微信(WxPusher)推送里也能看到告警
-        html = render_html(title, yl, ck, catl)
+        html = render_html(title, yl, ck, catl, cat or {})
         jobs = []
         if feishu:
             jobs.append(("飞书", lambda: push_feishu(feishu, title, yl, ck, catl)))
