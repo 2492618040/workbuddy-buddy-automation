@@ -407,12 +407,13 @@ def letter_block(cat):
     parts = []
     if photo:
         u = html_lib.escape(str(photo))
+        big = html_lib.escape(str(cat.get("photo_full") or photo))
         # 微信内 HTML 的 <img> 外链常被过滤，故以「可点击链接 + 消息 url 字段」
-        # 为主确保能打开；<img> 作为 App 端可直接内显的增强，两者并存。
+        # 为主确保能打开；<img> 小头像作为 App 端可直接内显的增强。
         parts.append(
-            '<p style="margin:4px 0">🐾 猫猫照片：<a href="%s">👉 点击查看 / 保存大图</a>'
+            '<p style="margin:4px 0">🐾 猫猫照片：<a href="%s">👉 点击查看 / 保存全身大图</a>'
             '<br/><img src="%s" alt="猫猫照片" style="max-width:200px;border-radius:8px"/></p>'
-            % (u, u))
+            % (big, u))
     if letter.get("text"):
         where = letter.get("location")
         head = "✉️ 猫猫来信" + (f"（来自{html_lib.escape(str(where))}）" if where else "")
@@ -442,7 +443,8 @@ def do_cat_flow(opener, headers, adopt=False, location_id=None):
     out = {
         "success": True,               # 猫猫部分是否按预期走完（无异常）
         "buddy_name": None,
-        "photo": None,                 # 猫猫照片 URL（thumbnail_url）
+        "photo": None,                 # 猫猫小头像 URL（正文内嵌预览，加载快）
+        "photo_full": None,            # 猫猫全身立绘 URL（点消息打开的大图）
         "letter": None,                # {"text","guide","location"} 猫猫来信
         "claim": None,                 # {"reward_credit": n, "letter": "..."}
         "depart": None,                # {"location": "咖啡馆", "location_id": 1}
@@ -499,9 +501,11 @@ def do_cat_flow(opener, headers, adopt=False, location_id=None):
             return out
 
     out["buddy_name"] = buddy.get("name") or buddy.get("nickname") or "猫猫"
-    # 猫猫照片：旅行地点封面实测均为空，改用猫猫自身立绘（头像/全身图）展示
-    out["photo"] = (buddy.get("thumbnail_url") or buddy.get("base_static_url")
-                    or buddy.get("full_animated_url"))
+    # 猫猫照片：旅行地点封面实测均为空，改用猫猫自身立绘。
+    # base_static_url=全身立绘(2048x2048，更好看) 作点开大图；thumbnail_url=小头像作正文内嵌预览。
+    out["photo_full"] = (buddy.get("base_static_url") or buddy.get("full_animated_url")
+                         or buddy.get("thumbnail_url"))
+    out["photo"] = (buddy.get("thumbnail_url") or out["photo_full"])
 
     # 1) 先领取已到家的旅行积分
     try:
@@ -958,8 +962,9 @@ def main():
         if feishu:
             jobs.append(("飞书", lambda: push_feishu(feishu, title, yl, ck, catl)))
         if wx_token and wx_uids:
-            # url 字段指向猫猫照片：微信内 <img> 外链常被过滤，点消息原文可打开图片
-            photo_url = (cat or {}).get("photo") if isinstance(cat, dict) else None
+            # url 字段指向猫猫全身立绘：微信内 <img> 外链常被过滤，点消息原文可打开大图
+            photo_url = ((cat or {}).get("photo_full") or (cat or {}).get("photo")
+                         if isinstance(cat, dict) else None)
             jobs.append(("微信(WxPusher)",
                          lambda: push_wxpusher(wx_token, wx_uids, title, html, url=photo_url)))
         if pp_token:
