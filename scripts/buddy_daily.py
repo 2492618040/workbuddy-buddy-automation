@@ -407,9 +407,11 @@ def letter_block(cat):
     parts = []
     if photo:
         u = html_lib.escape(str(photo))
+        # 微信内 HTML 的 <img> 外链常被过滤，故以「可点击链接 + 消息 url 字段」
+        # 为主确保能打开；<img> 作为 App 端可直接内显的增强，两者并存。
         parts.append(
-            '<p style="margin:4px 0">🐾 <a href="%s">查看猫猫照片</a>'
-            '<br/><img src="%s" alt="Buddy" style="max-width:180px;border-radius:8px"/></p>'
+            '<p style="margin:4px 0">🐾 猫猫照片：<a href="%s">👉 点击查看 / 保存大图</a>'
+            '<br/><img src="%s" alt="猫猫照片" style="max-width:200px;border-radius:8px"/></p>'
             % (u, u))
     if letter.get("text"):
         where = letter.get("location")
@@ -663,7 +665,7 @@ def push_feishu(webhook, title, yesterday_lines, checkin_lines, cat_lines):
     return True
 
 
-def push_wxpusher(app_token, uids, title, html):
+def push_wxpusher(app_token, uids, title, html, url=None):
     if isinstance(uids, str):
         uid_list = [u.strip() for u in uids.replace("，", ",").replace("；", ";")
                     .replace(";", ",").split(",") if u.strip()]
@@ -671,13 +673,18 @@ def push_wxpusher(app_token, uids, title, html):
         uid_list = [str(u).strip() for u in uids if str(u).strip()]
     if not uid_list:
         raise ApiError("WxPusher 未配置接收 UID")
-    body = json.dumps({
+    payload = {
         "appToken": app_token,
         "content": html,
         "summary": (title or "")[:100],
         "uids": uid_list,
         "contentType": 2,   # HTML
-    }, ensure_ascii=False).encode("utf-8")
+    }
+    # WxPusher 文档不保证 HTML 正文里的 <img> 外链能在微信内渲染，
+    # 但 url（原文链接）是明确支持的字段：点消息即可打开图片/页面。
+    if url and str(url).startswith(("http://", "https://")):
+        payload["url"] = str(url)[:1000]
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(WXPUSHER_URL, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
     opener = build_opener()
@@ -951,7 +958,10 @@ def main():
         if feishu:
             jobs.append(("飞书", lambda: push_feishu(feishu, title, yl, ck, catl)))
         if wx_token and wx_uids:
-            jobs.append(("微信(WxPusher)", lambda: push_wxpusher(wx_token, wx_uids, title, html)))
+            # url 字段指向猫猫照片：微信内 <img> 外链常被过滤，点消息原文可打开图片
+            photo_url = (cat or {}).get("photo") if isinstance(cat, dict) else None
+            jobs.append(("微信(WxPusher)",
+                         lambda: push_wxpusher(wx_token, wx_uids, title, html, url=photo_url)))
         if pp_token:
             jobs.append(("微信(pushplus)", lambda: push_pushplus(pp_token, title, html)))
         for name, fn in jobs:
